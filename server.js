@@ -301,7 +301,10 @@ process.on('SIGTERM', () => {
   });
 });
 
-startServer();
+// Start server only if not in Vercel serverless environment
+if (!process.env.VERCEL) {
+  startServer();
+}
 
 module.exports = app;
 
