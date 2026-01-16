@@ -1,0 +1,678 @@
+const express = require('express');
+const { body, validationResult } = require('express-validator');
+const rateLimit = require('express-rate-limit');
+const { Task, User, Notification } = require('../models');
+const { requireRole } = require('../middleware/auth');
+const auditMiddleware = require('../middleware/audit');
+const { sendTaskAssignmentEmail } = require('../services/emailService');
+const multer = require('multer');
+const streamifier = require('streamifier');
+const cloudinary = require('cloudinary').v2;
+
+// configure Cloudinary via env vars
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+
+const router = express.Router();
+
+// HOD Panel specific rate limiting - Very lenient for dashboard usage
+const hodPanelLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 1000, // Allow 1000 requests per 5 minutes for HOD panel
+  message: {
+    error: 'Too many HOD panel requests, please wait a moment.',
+    retryAfter: 5
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Apply HOD panel rate limiter to all task routes
+router.use(hodPanelLimiter);
+
+// PATCH /api/tasks/:id/status - update only status
+const validateTaskStatus = [
+  body('status').isIn(['todo', 'assigned', 'in_progress', 'review', 'completed', 'cancelled', 'blocked'])
+];
+
+router.patch('/:id/status', validateTaskStatus, auditMiddleware.taskStatusChanged, async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: 'Validation failed', details: errors.array() });
+
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+
+    // allow update if user is admin/super_admin/hr/hr_manager or task assignedTo/assignedBy
+    const allowedRoles = ['admin', 'super_admin', 'department_head', 'manager', 'hr', 'hr_manager'];
+    const isRelated = req.user && ((task.assignedTo && task.assignedTo.toString() === req.user.id) || (task.assignedBy && task.assignedBy.toString() === req.user.id));
+    if (!isRelated && !allowedRoles.includes(req.user.role)) {
+      console.log('Status change denied for user', req.user && req.user.id);
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const prevStatus = task.status;
+    task.status = req.body.status;
+    task.updatedAt = new Date();
+
+    await task.save();
+
+    await populateTaskQuery(Task.findById(task._id));
+
+    console.log(`Task ${task._id} status changed from ${prevStatus} to ${task.status} by ${req.user.id}`);
+    return res.json({ success: true, data: task });
+  } catch (err) {
+    console.error('Failed to update task status:', err);
+    return res.status(500).json({ error: 'Failed to update task status' });
+  }
+});
+
+// helper: upload buffer to cloudinary, returns result
+const uploadBufferToCloudinary = (buffer, options = {}) => {
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(options, (error, result) => {
+      if (error) return reject(error);
+      resolve(result);
+    });
+    streamifier.createReadStream(buffer).pipe(uploadStream);
+  });
+};
+
+// multer memory storage for buffering uploads before streaming to Cloudinary
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: (process.env.MAX_UPLOAD_MB ? parseInt(process.env.MAX_UPLOAD_MB) : 50) * 1024 * 1024 }
+});
+
+// Helper: populate common relations
+const populateTaskQuery = (q) => q
+  .populate('assignedTo', 'name email role')
+  .populate('assignedBy', 'name email role')
+  .populate('companyId', 'name')
+  .populate('departmentId', 'name');
+
+// GET /api/tasks - list
+router.get('/', async (req, res) => {
+  try {
+    console.log('GET /api/tasks - Request from user:', {
+      id: req.user?.id,
+      role: req.user?.role,
+      companyId: req.user?.companyId,
+      email: req.user?.email
+    });
+    
+    const filter = {};
+    const { departmentId } = req.query;
+    const assignedToQuery = req.query.assignedTo;
+
+    // If a departmentId query param is provided, allow HOD/department_head and admins to fetch department tasks
+    if (departmentId) {
+      console.log('GET /api/tasks - departmentId requested:', departmentId, 'by user:', req.user && req.user.id);
+      // allow if admin or super_admin, or if requester is department_head of that department, or if HR user
+      if (req.user.role === 'admin' || req.user.role === 'super_admin' || (req.user.role === 'department_head' && String(req.user.departmentId) === String(departmentId)) || req.user.role === 'hr' || req.user.role === 'hr_manager') {
+        filter.departmentId = departmentId;
+      } else {
+        console.log('Access denied for department tasks request by user', req.user && req.user.id);
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    } else if (assignedToQuery) {
+      // Support querying tasks assigned to one or more users via ?assignedTo=id1,id2
+      // Parse CSV and build $in filter
+      const ids = String(assignedToQuery).split(',').map(s => s.trim()).filter(Boolean);
+      console.log('GET /api/tasks - assignedTo requested:', ids, 'by user:', req.user && req.user.id);
+
+      // Allow admins, super_admins, department_heads, managers, and HR users to use this filter
+      // Also allow a regular member to request only their own tasks via ?assignedTo=<theirId>
+      const isSelfRequest = ids.length === 1 && String(ids[0]) === String(req.user.id);
+      if (isSelfRequest || req.user.role === 'admin' || req.user.role === 'super_admin' || req.user.role === 'department_head' || req.user.role === 'manager' || req.user.role === 'hr' || req.user.role === 'hr_manager') {
+        filter.assignedTo = { $in: ids };
+      } else {
+        console.log('Access denied for assignedTo tasks request by user', req.user && req.user.id);
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    } else {
+      // Company admin and HR users see company tasks, others see assigned/created
+      if (req.user.role === 'admin' || req.user.role === 'hr' || req.user.role === 'hr_manager') {
+        filter.companyId = req.user.companyId;
+        console.log('GET /api/tasks - Using company filter:', filter);
+      } else if (req.user.role !== 'super_admin') {
+        filter.$or = [
+            { assignedTo: req.user.id },
+            { assignedBy: req.user.id }
+          ];
+        console.log('GET /api/tasks - Using user filter:', filter);
+        }
+    }
+
+    console.log('GET /api/tasks - Final filter:', filter);
+    const tasks = await populateTaskQuery(Task.find(filter)).sort({ dueDate: 1 });
+    console.log('GET /api/tasks - Found tasks:', tasks.length);
+
+    res.status(200).json({ success: true, data: tasks });
+  } catch (error) {
+    console.error('Get tasks error:', error);
+    res.status(500).json({ error: 'Failed to get tasks', message: 'Internal server error' });
+  }
+});
+
+// GET /api/tasks/hr-management - HR Management API for tasks
+router.get('/hr-management', requireRole(['hr', 'admin', 'super_admin']), async (req, res) => {
+  try {
+    console.log('GET /api/tasks/hr-management - Request from user:', {
+      id: req.user?.id,
+      role: req.user?.role,
+      companyId: req.user?.companyId,
+      email: req.user?.email
+    });
+
+    // Filter for company tasks excluding overdue, completed, blocked, and cancelled tasks
+    const filter = {
+      companyId: req.user.companyId,
+      status: { 
+        $nin: ['completed', 'blocked', 'cancelled'] // Exclude these statuses
+      },
+      // Exclude overdue tasks
+      $or: [
+        { dueDate: { $exists: false } }, // Tasks without due date
+        { dueDate: null }, // Tasks with null due date
+        { dueDate: { $gte: new Date() } } // Tasks with due date in future
+      ]
+    };
+
+    console.log('GET /api/tasks/hr-management - Filter:', filter);
+
+    // Get tasks with populated fields
+    const tasks = await populateTaskQuery(Task.find(filter))
+      .sort({ createdAt: -1 }) // Sort by newest first
+      .limit(500); // Limit to prevent large responses
+
+    console.log('GET /api/tasks/hr-management - Found tasks:', tasks.length);
+
+    // Additional filtering to ensure we don't include overdue tasks
+    const filteredTasks = tasks.filter(task => {
+      // Double-check for overdue tasks
+      if (task.dueDate && new Date(task.dueDate) < new Date()) {
+        return false;
+      }
+      return true;
+    });
+
+    console.log('GET /api/tasks/hr-management - After overdue filter:', filteredTasks.length);
+
+    res.status(200).json({ 
+      success: true, 
+      data: filteredTasks,
+      total: filteredTasks.length,
+      filters: {
+        companyId: req.user.companyId,
+        excludedStatuses: ['completed', 'blocked', 'cancelled'],
+        excludeOverdue: true
+      }
+    });
+  } catch (error) {
+    console.error('HR Management tasks error:', error);
+    res.status(500).json({ 
+      error: 'Failed to get HR management tasks', 
+      message: 'Internal server error' 
+    });
+  }
+});
+
+// GET /api/tasks/:id
+router.get('/:id', async (req, res) => {
+  try {
+    const task = await populateTaskQuery(Task.findById(req.params.id));
+    console.log('Task:', task);
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+    res.json({ success: true, data: task });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch task' });
+  }
+});
+
+// Create task - supports optional file uploads in multipart/form-data under field name `files`
+const validateTaskCreation = [
+  body('title').notEmpty(),
+  body('priority').isIn(['low', 'medium', 'high', 'urgent']),
+  body('status').optional().isIn(['todo', 'assigned', 'in_progress', 'review', 'completed', 'cancelled']),
+  body('dueDate').optional().isISO8601()
+];
+
+router.post('/', upload.array('files'), validateTaskCreation, auditMiddleware.taskCreated, async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: 'Validation failed', details: errors.array() });
+
+    const { title, description, assignedTo, priority, status = 'assigned', dueDate, departmentId, assigneeType, assignedToRole } = req.body;
+    const assignedBy = req.user.id;
+
+    const creator = await User.findById(assignedBy);
+    if (!creator) return res.status(404).json({ error: 'Creator not found' });
+
+    // If assignedTo given, verify
+    if (assignedTo) {
+      const user = await User.findById(assignedTo);
+      if (!user) return res.status(404).json({ error: 'Assigned user not found' });
+    }
+
+    const task = new Task({
+      title,
+      description,
+      assignedTo: assignedTo || null,
+      assignedBy,
+      assignedByRole: creator.role,
+      companyId: creator.companyId,
+      departmentId: departmentId || creator.departmentId,
+      priority,
+      status,
+      dueDate: (function() {
+        if (!dueDate) return null;
+        // if date-only string like YYYY-MM-DD, treat as UTC midnight
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return new Date(dueDate + 'T00:00:00Z');
+        return new Date(dueDate);
+      })(),
+      assigneeType: assigneeType || (assignedTo ? 'user' : 'user'),
+      assignedToRole: assignedToRole || null
+    });
+
+    // initial assignment history
+    if (task.assignedTo) {
+      task.assignmentHistory = [{ from: null, to: task.assignedTo, by: assignedBy, byRole: creator.role, at: task.createdAt || new Date(), note: 'Initial assignment' }];
+    }
+
+    // Save initial task to obtain _id for folder naming
+    await task.save();
+
+    // If files were uploaded in the same request, upload them to Cloudinary and attach
+    if (req.files && Array.isArray(req.files) && req.files.length > 0) {
+      console.log('Files received on create:', req.files.map(f => ({ originalname: f.originalname, size: f.size })));
+      const folder = `tasks/${task._id}`;
+      task.attachments = task.attachments || [];
+      for (const f of req.files) {
+        try {
+          const mime = f.mimetype || '';
+          const isImage = mime.startsWith('image/');
+          const isPdf = mime === 'application/pdf';
+          // For PDFs generate an image preview by uploading as image/jpg with a page transform
+          const resourceType = isImage || isPdf ? 'image' : 'raw';
+          const uploadOptions = { resource_type: resourceType, folder };
+          if (isPdf) {
+            // generate JPG preview of first page
+            uploadOptions.format = 'jpg';
+            uploadOptions.transformation = [{ page: 1, quality: 'auto', fetch_format: 'auto' }];
+          }
+          console.log('Uploading file to Cloudinary:', f.originalname, 'options=', uploadOptions);
+          const result = await uploadBufferToCloudinary(f.buffer, uploadOptions);
+          console.log('Uploaded to Cloudinary:', result.public_id, 'format=', result.format);
+          // fallback format from mimetype
+          const fileFormat = result.format || (mime.split('/')[1] || 'N/A');
+          task.attachments.push({ name: f.originalname, url: result.secure_url || result.url, size: f.size, type: f.mimetype, format: fileFormat, uploadedBy: req.user.id, uploadedAt: new Date() });
+        } catch (uploadErr) {
+          console.error('Error uploading file during task create:', uploadErr);
+          // continue with other files, but record error
+        }
+      }
+
+      try {
+        await task.save();
+        console.log('Task updated with attachments after create. attachmentsCount=', task.attachments.length);
+      } catch (saveErr) {
+        console.error('Error saving task attachments after upload:', saveErr);
+      }
+    }
+
+    await populateTaskQuery(Task.findById(task._id));
+
+    // Create notification if task is assigned to someone
+    if (task.assignedTo) {
+      try {
+        console.log('🔔 Creating notification for task assignment');
+        console.log('👤 Assigned to:', task.assignedTo);
+        console.log('📝 Task title:', task.title);
+
+        const notification = new Notification({
+          recipient: task.assignedTo,
+          sender: req.user.id,
+          companyId: req.user.companyId,
+          title: `New Task Assigned: ${task.title}`,
+          message: `You have been assigned a new task: ${task.title}`,
+          type: 'task_assigned',
+          priority: task.priority,
+          actionUrl: `/tasks/${task._id}`,
+          actionText: 'View Task',
+          data: {
+            taskId: task._id,
+            taskTitle: task.title,
+            assignedBy: req.user.id
+          }
+        });
+
+        await notification.save();
+        console.log('✅ Notification created successfully:', notification._id);
+      } catch (notificationError) {
+        console.error('❌ Failed to create notification:', notificationError);
+        // Don't fail the task creation if notification fails
+      }
+    }
+
+    // Send email notification for urgent priority tasks only
+    if (task.assignedTo && task.priority === 'urgent') {
+      try {
+        console.log('📧 Sending urgent task assignment email');
+        console.log('🚨 Priority:', task.priority);
+        console.log('👤 Assigned to:', task.assignedTo);
+
+        // Get assignee details
+        const assignee = await User.findById(task.assignedTo).select('firstName lastName email');
+        if (!assignee || !assignee.email) {
+          console.log('⚠️ Assignee not found or no email for urgent task notification');
+        } else {
+          // Get company name
+          const company = await User.findById(req.user.id).populate('companyId', 'name');
+          const companyName = company?.companyId?.name || 'NevoStack';
+
+          // Get assigner details
+          const assigner = await User.findById(req.user.id).select('firstName lastName email role');
+
+          // Get department name if available
+          let departmentName = null;
+          if (task.departmentId) {
+            const Department = require('../models/Department');
+            const dept = await Department.findById(task.departmentId).select('name');
+            departmentName = dept?.name;
+          }
+
+          // Prepare task data for email
+          const taskDataForEmail = {
+            id: task._id,
+            title: task.title,
+            description: task.description,
+            priority: task.priority,
+            status: task.status,
+            dueDate: task.dueDate,
+            departmentName: departmentName
+          };
+
+          // Send email to assignee
+          const emailResult = await sendTaskAssignmentEmail(
+            assignee.email,
+            `${assignee.firstName} ${assignee.lastName}`,
+            taskDataForEmail,
+            {
+              firstName: assigner.firstName,
+              lastName: assigner.lastName,
+              role: assigner.role,
+              email: assigner.email
+            },
+            companyName
+          );
+
+          if (emailResult.success) {
+            console.log('✅ Urgent task assignment email sent to:', assignee.email);
+          } else {
+            console.log('⚠️ Urgent task assignment email failed to send to:', assignee.email, emailResult.error);
+          }
+        }
+      } catch (emailError) {
+        console.error('❌ Failed to send urgent task assignment email:', emailError);
+        // Don't fail the task creation if email sending fails
+      }
+    }
+
+    res.status(201).json({ success: true, data: task });
+  } catch (error) {
+    console.error('Create task error:', error);
+    res.status(500).json({ error: 'Failed to create task' });
+  }
+});
+
+// Assign task to user/role/department
+const validateTaskAssignment = [
+  body('assigneeType').isIn(['user', 'role', 'department']),
+  body('assignedTo').optional().isMongoId(),
+  body('assignedToRole').optional().isString()
+];
+
+router.post('/:id/assign', validateTaskAssignment, auditMiddleware.taskAssigned, async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: 'Validation failed', details: errors.array() });
+
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+
+    const { assigneeType, assignedTo, assignedToRole } = req.body;
+    const actor = await User.findById(req.user.id);
+    if (!actor) return res.status(404).json({ error: 'Actor not found' });
+
+    // Authorization: only admin/department_head/manager/hr/hr_manager can assign (basic)
+    if (!['admin', 'super_admin', 'department_head', 'manager', 'hr', 'hr_manager'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    let resolvedUserId = null;
+    if (assigneeType === 'user' && assignedTo) {
+      const u = await User.findById(assignedTo);
+      if (!u) return res.status(404).json({ error: 'Assigned user not found' });
+      resolvedUserId = u._id;
+    } else if (assigneeType === 'role' && assignedToRole) {
+      // Resolve to a user with that role in same department/company - pick first
+      const u = await User.findOne({ role: assignedToRole, companyId: actor.companyId, departmentId: task.departmentId });
+      if (!u) return res.status(404).json({ error: 'No user found for role in department' });
+      resolvedUserId = u._id;
+    } else if (assigneeType === 'department') {
+      // assign to department: choose department head if exists
+      const u = await User.findOne({ role: 'department_head', companyId: actor.companyId, departmentId: task.departmentId });
+      if (!u) return res.status(404).json({ error: 'No department head found' });
+      resolvedUserId = u._id;
+    } else {
+      return res.status(400).json({ error: 'Invalid assignee payload' });
+    }
+
+    const prev = task.assignedTo ? task.assignedTo.toString() : null;
+    task.assignedTo = resolvedUserId;
+    task.assigneeType = assigneeType;
+    task.assignedToRole = assignedToRole || task.assignedToRole;
+    task.assignmentHistory = task.assignmentHistory || [];
+    task.assignmentHistory.push({ from: prev, to: resolvedUserId, by: actor._id, byRole: actor.role, at: new Date(), note: 'Reassigned via API' });
+
+    await task.save();
+    await populateTaskQuery(Task.findById(task._id));
+    res.json({ success: true, task });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to assign task' });
+  }
+});
+
+// Update task (PUT)
+router.put('/:id', [
+  body('priority').optional().isIn(['low', 'medium', 'high', 'urgent']),
+  body('status').optional().isIn(['todo', 'assigned', 'in_progress', 'review', 'completed', 'cancelled'])
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: 'Validation failed', details: errors.array() });
+
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+
+    const updatable = ['title', 'description', 'priority', 'status', 'dueDate', 'progress'];
+    updatable.forEach((f) => {
+      if (req.body[f] === undefined) return;
+      if (f === 'dueDate' && typeof req.body.dueDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.body.dueDate)) {
+        task.dueDate = new Date(req.body.dueDate + 'T00:00:00Z');
+      } else if (f === 'dueDate') {
+        task.dueDate = req.body.dueDate ? new Date(req.body.dueDate) : null;
+      } else {
+        task[f] = req.body[f];
+      }
+    });
+
+    // handle reassignment
+    if (req.body.assignedTo && req.body.assignedTo !== (task.assignedTo && task.assignedTo.toString())) {
+      const u = await User.findById(req.body.assignedTo);
+      if (!u) return res.status(404).json({ error: 'Assigned user not found' });
+      task.assignmentHistory = task.assignmentHistory || [];
+      task.assignmentHistory.push({ from: task.assignedTo || null, to: u._id, by: req.user.id, byRole: req.user.role, at: new Date(), note: 'Reassigned via update' });
+      task.assignedTo = u._id;
+      task.assigneeType = 'user';
+    }
+
+    await task.save();
+    await populateTaskQuery(Task.findById(task._id));
+    res.json({ success: true, data: task });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update task' });
+  }
+});
+
+// Delete task
+router.delete('/:id', async (req, res) => {
+  try {
+    const task = await Task.findByIdAndDelete(req.params.id);
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+    res.json({ success: true, message: 'Task deleted' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete task' });
+  }
+});
+
+// Comments: add comment
+router.post('/:id/comments', [body('text').notEmpty()], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ error: 'Validation failed' });
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+    task.comments.push({ text: req.body.text, author: req.user.id });
+    await task.save();
+    res.status(201).json({ success: true, comments: task.comments });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to add comment' });
+  }
+});
+
+// Comments: list
+router.get('/:id/comments', async (req, res) => {
+  try {
+    const task = await Task.findById(req.params.id).populate('comments.author', 'name email');
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+    res.json({ success: true, comments: task.comments });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to get comments' });
+  }
+});
+
+// Attachments: upload file to Cloudinary and add to task.attachments
+// Expects multipart/form-data with field `file`
+router.post('/:id/attachments', upload.single('file'), async (req, res) => {
+  try {
+    console.log('Attachments upload called for taskId=', req.params.id, 'by user=', req.user && req.user.id);
+
+    if (!req.file) {
+      console.log('No file present on request');
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    console.log('Uploaded file info:', { originalname: req.file.originalname, mimetype: req.file.mimetype, size: req.file.size });
+
+    const task = await Task.findById(req.params.id);
+    if (!task) {
+      console.log('Task not found for id=', req.params.id);
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    console.log('Found task:', { id: task._id.toString(), assignedTo: task.assignedTo ? task.assignedTo.toString() : null, assignedBy: task.assignedBy ? task.assignedBy.toString() : null });
+
+    // Basic authorization: allow uploader if admin/super_admin/hr/hr_manager or assignedBy/assignedTo/department_head/manager
+    const allowedRoles = ['admin', 'super_admin', 'department_head', 'manager', 'hr', 'hr_manager'];
+    const isRelatedUser = (req.user && (task.assignedTo && task.assignedTo.toString() === req.user.id || task.assignedBy && task.assignedBy.toString() === req.user.id));
+    console.log('Authorization check: isRelatedUser=', isRelatedUser, 'userRole=', req.user && req.user.role);
+
+    if (!isRelatedUser && !allowedRoles.includes(req.user.role)) {
+      console.log('Access denied for user', req.user && req.user.id);
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Choose resource type and upload options based on mimetype
+    const mime = req.file.mimetype || '';
+    const isImage = mime.startsWith('image/');
+    const isPdf = mime === 'application/pdf';
+    const folder = `tasks/${task._id}`;
+
+    // For PDFs, request an image preview (JPG of first page) from Cloudinary
+    const uploadOptions = isPdf || isImage
+      ? { resource_type: 'image', folder }
+      : { resource_type: 'raw', folder };
+
+    if (isPdf) {
+      uploadOptions.format = 'jpg';
+      uploadOptions.transformation = [{ page: 1, quality: 'auto', fetch_format: 'auto' }];
+    }
+
+    console.log('Resource type/options determined for upload:', uploadOptions);
+
+    // stream upload
+    const uploadStream = cloudinary.uploader.upload_stream(uploadOptions, async (error, result) => {
+      if (error) {
+        console.error('Cloudinary upload error:', error);
+        return res.status(500).json({ error: 'Upload failed', details: error.message || error });
+      }
+
+      console.log('Cloudinary upload succeeded:', { public_id: result.public_id, url: result.secure_url || result.url });
+
+      // preserve detected format (jpg, png, pdf, etc) for frontend display
+      const attachment = {
+        name: req.file.originalname,
+        url: result.secure_url || result.url,
+        size: req.file.size,
+        type: req.file.mimetype,
+        format: result.format || (req.file.mimetype ? req.file.mimetype.split('/')[1] : 'N/A'),
+        uploadedBy: req.user.id,
+        uploadedAt: new Date()
+      };
+
+      task.attachments = task.attachments || [];
+      task.attachments.push(attachment);
+
+      try {
+        const saved = await task.save();
+        console.log('Task saved after attaching file. attachmentsCount=', saved.attachments.length);
+      } catch (saveErr) {
+        console.error('Error saving task with attachment:', saveErr);
+        return res.status(500).json({ error: 'Failed to save attachment to task' });
+      }
+
+      return res.status(201).json({ success: true, attachment });
+    });
+
+    console.log('Starting stream to Cloudinary for file:', req.file.originalname);
+    streamifier.createReadStream(req.file.buffer).pipe(uploadStream);
+  } catch (err) {
+    console.error('Attachment upload error:', err);
+    res.status(500).json({ error: 'Failed to upload attachment' });
+  }
+});
+
+module.exports = router;
+
+
+
+
+
+
+
+
+
+
+
