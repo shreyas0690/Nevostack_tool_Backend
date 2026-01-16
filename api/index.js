@@ -101,6 +101,8 @@ app.use(cors({
         'Origin',
         'Accept',
         'Cache-Control',
+        'Pragma',
+        'Expires',
         'X-Device-Id',
         'X-Refresh-Token'
     ],
